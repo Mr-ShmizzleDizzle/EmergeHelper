@@ -76,8 +76,18 @@ def _annotate(pkg: index.Package) -> str:
 
 
 def _iter_rows() -> list[str]:
-    """Raw index lines, minus the stamp header. Rebuilds the cache if stale."""
-    if index.is_stale():
+    """Raw index lines, minus the stamp header.
+
+    A stale index is used as-is. This runs on every Tab press, and the stamp
+    goes stale on every install and every sync - rebuilding here would make
+    the shell hang for as long as the rebuild takes, which for a repository
+    with no metadata cache is minutes. The cost of not rebuilding is a
+    slightly out-of-date ``[I]`` marker until the next ``eh install`` or
+    ``eh index``; the cost of rebuilding is an unusable Tab key.
+
+    A *missing* index is still built, since there is nothing to fall back on.
+    """
+    if not os.path.exists(index.index_path()):
         try:
             index.save(index.build())
         except (OSError, RuntimeError):

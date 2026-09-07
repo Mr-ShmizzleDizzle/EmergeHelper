@@ -268,17 +268,9 @@ class Monitor:
         Used to decide when an interactive prelude (typically sudo asking for
         a password) is over and the full-screen UI can take the terminal.
         """
-        markers = (
-            ">>>",
-            "Calculating dependencies",
-            "These are the packages",
-            "emerge:",
-            "Local copy of remote index",
-            "!!!",
-        )
         with self.state.lock:
             for line in self.state.lines:
-                if any(m in line for m in markers):
+                if any(m in line for m in _PORTAGE_MARKERS):
                     return True
         return False
 

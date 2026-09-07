@@ -27,6 +27,7 @@ it actually merges packages or writes to `/etc/portage`.
 
 ```sh
 eh -i app-admin/conky         # or: eh install app-admin/conky
+eh -i conky htop mpv          # several at once, resolved as one merge
 eh -u                         # @world --update --deep --newuse
 ```
 
@@ -44,6 +45,10 @@ Every action has a short flag and a word form — use whichever is faster:
 
 The action flag can go anywhere, so `eh -i emacs -y` works. Combining it with
 other short flags (`-iy`) does not.
+
+Name as many packages as you like, in any arrangement — `eh -i vlc -y mpv`
+and `eh -i vlc -i mpv` both merge both packages. They are resolved together as
+a single request, so a USE flag one of them needs is only asked about once.
 
 While it runs:
 
@@ -81,8 +86,10 @@ Run `eh` as yourself, not under `sudo` — it escalates on its own. (`sudo eh`
 usually fails anyway, since sudo's `secure_path` doesn't include
 `~/.local/bin`.)
 
-You are asked for your password exactly once, by sudo, just as the merge
-starts. Two things make that work, both learned the hard way:
+You are asked for your password by sudo, just as the merge starts, on your
+real terminal — `eh` bridges it to the PTY until Portage's first output
+appears, then hands the screen to the UI. Three things make that work, all
+learned the hard way:
 
 - emerge runs on a PTY that `eh` gives its own session **and** sets as the
   controlling terminal. With only `setsid()`, sudo refuses to prompt at all —
@@ -91,6 +98,18 @@ starts. Two things make that work, both learned the hard way:
   silently declines to render its prompt while still consuming all three
   attempts, so you get *"Sorry, try again"* with nothing to type into. sudo
   only behaves as the direct child of the PTY.
+- `eh` never *predicts* whether a prompt is coming either. sudo's default
+  `timestamp_type` is `tty`, so a live timestamp belongs to the terminal it
+  was authenticated on — not to the PTY just opened for emerge, where sudo
+  asks again. `sudo -n true` succeeding proves nothing about the PTY, and
+  skipping the bridge on that basis leaves the prompt stranded behind the
+  full-screen UI with no way to answer it.
+
+That last point is also why each merge asks again even when you authenticated
+a moment ago: the ticket belongs to the terminal, and every merge gets a fresh
+PTY. On a system configured with `timestamp_type=global` (or `!tty_tickets`) a
+live ticket does cover it, sudo stays quiet, and the bridge hands over to the
+UI the moment Portage speaks — no configuration on `eh`'s side either way.
 
 Phase detection follows the markers Portage itself emits (`>>> Compiling
 source in …`, `>>> Jobs: 2 of 15 complete, 3 running`), and CPU/memory are
@@ -234,9 +253,15 @@ games-util/steam-launcher   Installer, launcher and supplementary files …  [1.
 ```
 
 Most overlays ship ebuilds with no `metadata/md5-cache`, so those are read
-through Portage's own API instead of the fast cache scan. They're small, so it
-costs about a second on a rebuild. Adding, removing or syncing a repo
-invalidates the index automatically.
+through Portage's own API instead of the fast cache scan. That costs a fork
+per ebuild, and Portage's own cache for the results (`/var/cache/edb/dep`) is
+owned by the `portage` group — so as an ordinary user the work is redone from
+scratch every time. `eh` caches it under `~/.cache/emergehelper/depcache`
+instead, where it can actually write, and caps how long the first, uncached
+pass may spend on any one repository; whatever it doesn't reach is listed by
+filename until the cache warms up. A 1700-package overlay takes a few minutes
+once (`eh -x --refresh`) and a moment thereafter, rather than a few minutes
+every time.
 
 Bare `<Tab>` offers the 174 categories; typing narrows them, and a `/` drills
 in. It works with version operators (`>=app-admin/conky-1.2`) and package sets
@@ -251,9 +276,12 @@ whole ebuild tree and `emerge --list-sets` on **every** Tab press:
 | result quality | 19404 bare names | filtered, with descriptions + versions |
 
 Completions come from a cached index of every package in every configured
-repository (19,411 here), rebuilt automatically when the tree changes
-(`emerge --sync`), a package is installed, or a repo is added or synced.
-Rebuild it by hand with `eh -x --refresh` (~3.5 s).
+repository (19,411 here). A Tab press never rebuilds it — a rebuild can take
+minutes for a repository with no metadata cache, and a Tab key that hangs is
+worse than a slightly stale one — so `eh` reads the index it has and keeps the
+`[I]` markers current by folding the vdb back in after each merge. Rebuild it
+after a sync, or after adding a repo, with `eh -x --refresh` (~3.5 s once the
+overlay metadata cache is warm); `eh -x` rebuilds too if the tree has moved on.
 
 ## Other commands
 

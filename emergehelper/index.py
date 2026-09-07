@@ -13,12 +13,13 @@ import os
 import shutil
 import sys
 import tempfile
+import time
 from dataclasses import dataclass
 
 PORTDIR = "/var/db/repos/gentoo"
 MD5_CACHE = os.path.join(PORTDIR, "metadata", "md5-cache")
 # Bumped whenever the on-disk format changes, so stale caches are rebuilt.
-INDEX_VERSION = "4"
+INDEX_VERSION = "5"
 
 # Live ebuilds are always masked and never what "the current version" means to
 # someone browsing packages, so they're excluded from version selection.
@@ -122,6 +123,69 @@ def repositories() -> list[Repository]:
 def cache_dir() -> str:
     base = os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache")
     return os.path.join(base, "emergehelper")
+
+
+def depcache_dir() -> str:
+    """Where Portage may cache metadata it generates on our behalf.
+
+    Portage's own dep cache (/var/cache/edb/dep) is owned by the portage
+    group, so a normal user can't write it: every ``aux_get`` on a repo
+    without a metadata cache re-sources the ebuild, forking ``ebuild.sh
+    depend`` each time. Pointing PORTAGE_DEPCACHEDIR at our own cache makes
+    that work survive between runs instead of being redone on every Tab press.
+    """
+    return os.path.join(cache_dir(), "depcache")
+
+
+_DBAPI = None  # built once; constructing a Portage config costs ~250ms
+
+
+def _cached_dbapi():
+    """A porttree dbapi that caches generated metadata where we can write it.
+
+    ``portage.db[...]`` is built from the ambient environment the first time
+    it is touched, and by then its depcachedir is already fixed - so this
+    builds a config of its own rather than setting PORTAGE_DEPCACHEDIR and
+    hoping nothing has read it yet. Keeping the variable out of the process
+    environment also keeps it away from child processes: the real emerge runs
+    under sudo and must not write root-owned files into the user's cache.
+
+    Returns ``None`` if Portage can't be loaded or configured.
+    """
+    global _DBAPI
+    if _DBAPI is not None:
+        return _DBAPI
+    try:
+        import portage
+        from portage.dbapi.porttree import portdbapi
+    except Exception:
+        return None
+
+    env = dict(os.environ)
+    if not env.get("PORTAGE_DEPCACHEDIR"):
+        # An explicit setting is the user's to make, not ours to override.
+        path = depcache_dir()
+        try:
+            os.makedirs(path, exist_ok=True)
+        except OSError:
+            _DBAPI = _plain_dbapi()
+            return _DBAPI
+        env["PORTAGE_DEPCACHEDIR"] = path
+    try:
+        _DBAPI = portdbapi(mysettings=portage.config(env=env))
+    except Exception:
+        _DBAPI = _plain_dbapi()
+    return _DBAPI
+
+
+def _plain_dbapi():
+    """The ambient porttree dbapi, for when a private config won't build."""
+    try:
+        import portage
+
+        return portage.db[portage.root]["porttree"].dbapi
+    except Exception:
+        return None
 
 
 def index_path() -> str:
@@ -331,29 +395,119 @@ def _scan_md5_cache(repo: Repository, progress: bool) -> tuple[dict, dict]:
     return versions, live_only
 
 
-def _scan_dbapi(repo: Repository, progress: bool) -> tuple[dict, dict]:
-    """Slow path for repos without a metadata cache.
+# How long metadata generation may take for one cacheless repository before
+# the rest of it is indexed by filename only. An overlay of a few dozen
+# packages finishes well inside this; a 1700-package one would otherwise
+# block a Tab press for minutes.
+DBAPI_BUDGET_SECONDS = 20.0
+
+
+def _categories(repo: Repository) -> list[str]:
+    """Category names in a repository.
+
+    ``profiles/categories`` is the authoritative list; without it, fall back
+    to the shape of the directory names, which keeps ``metadata``, ``eclass``,
+    ``licenses`` and ``.git`` out of a tree walk.
+    """
+    try:
+        with open(os.path.join(repo.location, "profiles", "categories"),
+                  encoding="utf-8") as fh:
+            names = [line.strip() for line in fh if line.strip()]
+        if names:
+            return names
+    except OSError:
+        pass
+    try:
+        return [
+            name
+            for name in os.listdir(repo.location)
+            if "-" in name or name == "virtual"
+        ]
+    except OSError:
+        return []
+
+
+def _scan_ebuild_names(
+    repo: Repository,
+    skip: set[str] | None = None,
+) -> tuple[dict, dict]:
+    """Cheapest possible scan: package names and versions, no metadata.
+
+    A directory walk over ``<repo>/<category>/<package>/*.ebuild``. There is
+    no DESCRIPTION, IUSE or KEYWORDS in the result, so these packages show up
+    in searches and completions with an empty description rather than not at
+    all - which is the right trade when generating their metadata would take
+    minutes.
+    """
+    versions: dict[str, tuple[str, dict[str, str], str, dict[str, str]]] = {}
+    live_only: dict[str, tuple[str, dict[str, str]]] = {}
+    skip = skip or set()
+
+    for category in _categories(repo):
+        cat_dir = os.path.join(repo.location, category)
+        try:
+            names = os.listdir(cat_dir)
+        except OSError:
+            continue
+        for name in names:
+            cp = f"{category}/{name}"
+            if cp in skip:
+                continue
+            try:
+                files = os.listdir(os.path.join(cat_dir, name))
+            except OSError:
+                continue
+            for filename in files:
+                if not filename.endswith(".ebuild"):
+                    continue
+                split = _split_cpv(filename[: -len(".ebuild")], category)
+                if not split:
+                    continue
+                _collect(versions, live_only, split[0], split[1], {})
+    return versions, live_only
+
+
+def _scan_dbapi(
+    repo: Repository,
+    progress: bool,
+    budget: float | None = DBAPI_BUDGET_SECONDS,
+) -> tuple[dict, dict]:
+    """Metadata path for repos without a pre-generated cache.
 
     Most overlays ship ebuilds only, with no ``metadata/md5-cache``, so there
     is nothing to parse directly. Ask Portage for the metadata instead - it
-    sources the ebuilds and caches the result itself. Overlays are small
-    (a handful of packages), so the cost is negligible.
+    sources the ebuild, which costs a fork per version.
+
+    Two things keep that from turning a lookup into a multi-minute stall:
+    the results are cached in a directory we can actually write (see
+    :func:`depcache_dir`, since Portage's own is root-owned), and ``budget``
+    caps how long the first, uncached pass may take. Whatever the budget
+    doesn't reach is filled in by :func:`_scan_ebuild_names`, so the package
+    list stays complete either way; the next scan reads the warm cache and
+    finishes the job.
     """
     versions: dict[str, tuple[str, dict[str, str], str, dict[str, str]]] = {}
     live_only: dict[str, tuple[str, dict[str, str]]] = {}
     keys = ["DESCRIPTION", "IUSE", "KEYWORDS", "SLOT", "REQUIRED_USE"]
+
+    db = _cached_dbapi()
     try:
-        import portage
-
-        db = portage.db[portage.root]["porttree"].dbapi
-        cps = db.cp_all(trees=[repo.location])
+        cps = [] if db is None else db.cp_all(trees=[repo.location])
     except Exception:
-        return versions, live_only
+        cps = []
+    if not cps:
+        # No Portage, or a config it refuses to load: the filename walk still
+        # lists the repository's packages.
+        return _scan_ebuild_names(repo)
 
-    if progress and cps:
-        print(f"\r  indexing {repo.name:<28}", end="", file=sys.stderr, flush=True)
-
-    for cp in cps:
+    deadline = None if budget is None else time.monotonic() + budget
+    done: set[str] = set()
+    for n, cp in enumerate(cps):
+        if deadline is not None and time.monotonic() > deadline:
+            break
+        if progress and n % 25 == 0:
+            label = f"  indexing {repo.name}/{cp}"[:76]
+            print("\r" + label.ljust(76), end="", file=sys.stderr, flush=True)
         try:
             cpvs = db.cp_list(cp, mytree=repo.location)
         except Exception:
@@ -368,11 +522,33 @@ def _scan_dbapi(repo: Repository, progress: bool) -> tuple[dict, dict]:
             if not version:
                 continue
             _collect(versions, live_only, cp, version[1], meta)
+        done.add(cp)
+
+    if len(done) < len(cps):
+        # Ran out of budget partway through. List the rest by filename so the
+        # overlay isn't half invisible until the cache warms up.
+        rest, rest_live = _scan_ebuild_names(repo, skip=done)
+        versions.update(rest)
+        live_only.update(rest_live)
+        if progress:
+            note = (
+                f"  {repo.name}: descriptions for {len(cps) - len(done)} package(s) "
+                "deferred until the metadata cache warms up"
+            )
+            print("\r" + note.ljust(76), file=sys.stderr)
     return versions, live_only
 
 
-def build(progress: bool = False) -> list[Package]:
-    """Index every configured repository, sorted by package name."""
+def build(
+    progress: bool = False,
+    budget: float | None = DBAPI_BUDGET_SECONDS,
+) -> list[Package]:
+    """Index every configured repository, sorted by package name.
+
+    ``budget`` caps the time spent generating metadata for any single
+    repository that ships no metadata cache; pass ``None`` (as ``eh index
+    --refresh`` does) to let it run to completion.
+    """
     installed = _installed_versions()
     # cp -> (best_visible, best_visible_meta, latest_any, latest_meta)
     best: dict[str, tuple[str, dict[str, str], str, dict[str, str]]] = {}
@@ -390,7 +566,7 @@ def build(progress: bool = False) -> list[Package]:
         if repo.has_md5_cache:
             found, found_live = _scan_md5_cache(repo, progress)
         else:
-            found, found_live = _scan_dbapi(repo, progress)
+            found, found_live = _scan_dbapi(repo, progress, budget=budget)
         best.update(found)
         live_only.update(found_live)
         for cp in list(found) + list(found_live):
@@ -528,9 +704,37 @@ def load(rebuild_if_stale: bool = True) -> list[Package]:
 
 
 def refresh(progress: bool = True) -> tuple[int, str]:
-    """Force a rebuild. Returns ``(package_count, index_path)``."""
-    packages = build(progress=progress)
+    """Force a full rebuild. Returns ``(package_count, index_path)``.
+
+    No time budget here: an explicit refresh is the one place the user has
+    asked to wait, and it warms the metadata cache that keeps every later
+    rebuild quick.
+    """
+    packages = build(progress=progress, budget=None)
     return len(packages), save(packages)
+
+
+def refresh_installed() -> int:
+    """Re-read installed versions into the cached index, and re-stamp it.
+
+    An install changes what is *installed*, not what *exists*, so there is no
+    need to re-read every repository for it - but the stamp covers the vdb, so
+    without this every merge would leave the index stale. Completion reads a
+    stale index rather than rebuilding (a rebuild there would hang the shell),
+    which makes keeping this column current worth the vdb walk it costs.
+
+    Returns the number of packages re-stamped, or 0 if there was no index.
+    """
+    if not os.path.exists(index_path()):
+        return 0
+    packages = load(rebuild_if_stale=False)
+    if not packages:
+        return 0
+    installed = _installed_versions()
+    for package in packages:
+        package.installed = installed.get(package.cp, "")
+    save(packages)
+    return len(packages)
 
 
 def clear() -> None:

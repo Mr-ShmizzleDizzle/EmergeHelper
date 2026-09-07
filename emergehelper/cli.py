@@ -41,21 +41,6 @@ def _sudo_available() -> bool:
     return True
 
 
-def _sudo_already_valid() -> bool:
-    """True when a sudo timestamp is live, so no prompt will be needed."""
-    if os.geteuid() == 0:
-        return True
-    try:
-        return (
-            subprocess.run(
-                ["sudo", "-n", "true"], capture_output=True, check=False
-            ).returncode
-            == 0
-        )
-    except (OSError, subprocess.SubprocessError):
-        return False
-
-
 def _interactive_stdin() -> bool:
     try:
         return os.isatty(sys.stdin.fileno())
@@ -124,12 +109,12 @@ def cmd_install(args) -> int:
             _suggest_for_violations(result)
         return 1
 
-    # Portage reports only the changes blocking the *current* resolve, so
-    # satisfying one batch can reveal the next (a 32-bit multilib stack for
-    # Steam surfaces a few packages at a time). Keep resolving until the plan
-    # comes back clean rather than making the user re-run eh for each round.
-    packages = index.load()
-    current_use = index.installed_use()
+    # Both are loaded on demand below: they only serve to explain a USE-flag
+    # change, and building the index can take a while the first time a repo
+    # without a metadata cache is scanned. A merge needing no config changes -
+    # the common case - shouldn't wait for that at all.
+    packages = None
+    current_use = None
     round_number = 0
     total_applied = 0
     written: dict[tuple[str, str], bool] = {}
@@ -138,6 +123,10 @@ def cmd_install(args) -> int:
     # is what actually keeps the count down.
     MAX_ROUNDS = 40
 
+    # Portage reports only the changes blocking the *current* resolve, so
+    # satisfying one batch can reveal the next (a 32-bit multilib stack for
+    # Steam surfaces a few packages at a time). Keep resolving until the plan
+    # comes back clean rather than making the user re-run eh for each round.
     while result.needs_changes:
         round_number += 1
         if round_number > MAX_ROUNDS:
@@ -168,6 +157,12 @@ def cmd_install(args) -> int:
         )
         if round_number == 1:
             print(S.dim("Nothing is written until you choose."))
+
+        if packages is None:
+            if index.is_stale():
+                print(S.dim("indexing packages…"), file=sys.stderr)
+            packages = index.load()
+            current_use = index.installed_use()
 
         proceed, applied = prompts.resolve_interactively(
             result,
@@ -296,19 +291,42 @@ def _run_with_ui(atoms: list[str], args) -> int:
         cols, rows = 120, 40
 
     mon = monitor.Monitor(cmd, log_path)
-    # Hold the reader back and pass the terminal through first: sudo ties its
-    # auth timestamp to the tty it was asked on, so priming with `sudo -v`
-    # doesn't cover the PTY we just made and the password has to be typed here.
-    # Bridge the real terminal to the PTY whenever sudo might still ask for a
-    # password, so the prompt is answerable before curses takes the screen.
-    needs_password = (
-        os.geteuid() != 0 and _interactive_stdin() and not _sudo_already_valid()
-    )
-    if needs_password:
-        print(S.dim("emerge needs root — sudo will ask for your password below."))
-    mon.start(cols=cols, rows=rows, defer_reader=needs_password)
-    if needs_password:
+    # Hold the reader back and pass the real terminal through to the PTY
+    # before curses takes the screen, so a sudo password prompt is answerable.
+    #
+    # This happens whenever sudo is involved, and deliberately does *not* try
+    # to predict whether a prompt is coming. sudo's default timestamp_type is
+    # `tty`, so a live timestamp belongs to the terminal it was authenticated
+    # on - not to the PTY we just opened for emerge. `sudo -n true` succeeding
+    # here (because something earlier in this shell authenticated, including
+    # eh's own writes to /etc/portage) says nothing about the PTY, where sudo
+    # asks again. Skipping the bridge on that basis put the prompt behind the
+    # full-screen UI, with no way to type into it: the merge simply hung.
+    #
+    # Bridging when no password is needed costs nothing - it returns as soon
+    # as Portage's first output appears.
+    may_prompt = os.geteuid() != 0 and _interactive_stdin()
+    if may_prompt:
+        print(S.dim("emerge needs root — sudo may ask for your password below."))
+    mon.start(cols=cols, rows=rows, defer_reader=may_prompt)
+    if may_prompt:
         mon.bridge()
+
+    # sudo can give up (three bad passwords, or no rights at all) before
+    # Portage ever runs. Starting curses then would flash an empty meter over
+    # the message the user needs to read, so hand the error straight back.
+    if (
+        mon.proc is not None
+        and mon.proc.poll() is not None
+        and not mon.portage_started()
+    ):
+        rc = mon.wait(timeout=5)
+        mon.close()
+        rc = 1 if rc is None else rc
+        print()
+        print(S.red(f"✗ emerge never started (exit {rc})"))
+        print(S.dim("  sudo could not authenticate, or refused the command."))
+        return rc
 
     from .ui import run_ui
 
@@ -336,6 +354,14 @@ def _run_with_ui(atoms: list[str], args) -> int:
         _explain_failure(log_path)
     if state.peak_rss():
         print(S.dim(f"  peak build memory {state.peak_rss() / (1 << 20):.0f} MiB"))
+    # The merge changed what's installed, so the index's [I] markers and its
+    # stamp are both out of date. Completion won't rebuild for itself (that
+    # would stall the shell), so fold the vdb back in here, where a fraction
+    # of a second after a build nobody notices.
+    try:
+        index.refresh_installed()
+    except OSError:
+        pass
     return rc
 
 
@@ -541,16 +567,41 @@ SUBCOMMANDS = {
 
 
 def normalize_argv(argv: list[str]) -> list[str]:
-    """Rewrite an action flag into the subcommand form argparse expects."""
+    """Rewrite action flags into the subcommand form argparse expects.
+
+    The flag may appear anywhere, and may be repeated: ``eh -i vlc -i mpv``
+    means the same as ``eh -i vlc mpv``. Repeating it is a natural way to name
+    several packages, and argparse would otherwise reject everything after the
+    second flag as unrecognised arguments.
+    """
     if not argv or argv[0] in SUBCOMMANDS:
         return argv
+
+    command = ""
+    rest: list[str] = []
     for i, token in enumerate(argv):
-        if token in ACTION_FLAGS:
-            return [ACTION_FLAGS[token]] + argv[:i] + argv[i + 1 :]
         # Stop at "--": everything after it is a value, not our flag.
         if token == "--":
+            rest.extend(argv[i:])
             break
-    return argv
+        action = ACTION_FLAGS.get(token)
+        if action is None:
+            rest.append(token)
+            continue
+        if not command:
+            command = action
+        elif action != command:
+            print(
+                S.red(
+                    f"eh: {token} asks for '{action}' but an earlier flag already "
+                    f"asked for '{command}'; pick one"
+                ),
+                file=sys.stderr,
+            )
+            raise SystemExit(2)
+    if not command:
+        return argv
+    return [command] + rest
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -623,7 +674,18 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     argv = normalize_argv(list(sys.argv[1:] if argv is None else argv))
     parser = build_parser()
-    args = parser.parse_args(argv)
+    args, extra = parser.parse_known_args(argv)
+    if extra:
+        atoms = getattr(args, "atoms", None)
+        options = [token for token in extra if token.startswith("-")]
+        if atoms is None or options:
+            parser.error("unrecognized arguments: " + " ".join(extra))
+        # argparse stops filling a nargs="*" positional at the first option it
+        # meets, so `eh -i firefox -y vlc` parses one package and calls the
+        # other an error. Anything left over that isn't an option is a package
+        # name; emerge resolves the whole set at once, so their order among
+        # themselves is all that matters and that is preserved.
+        args.atoms = atoms + extra
     if not getattr(args, "command", None):
         parser.print_help()
         return 0

@@ -68,7 +68,9 @@ for f in "$ROOT"/share/fish/completions/*.fish; do
 done
 
 echo
-echo "Building the package index (one-off, a couple of seconds)…"
+echo "Building the package index…"
+echo "  (seconds for the main tree; a repository with no metadata/md5-cache"
+echo "   is generated once here and cached, which can take a few minutes)"
 "$ROOT/bin/eh" index --refresh
 
 echo

@@ -440,7 +440,7 @@ def resolve_interactively(
             )
             print(
                 S.dim(
-                    "    This is a resolver flip-flop, not something ph can settle by\n"
+                    "    This is a resolver flip-flop, not something eh can settle by\n"
                     "    writing again. Try a wider scope for this flag, or resolve\n"
                     "    the conflict by hand."
                 )
