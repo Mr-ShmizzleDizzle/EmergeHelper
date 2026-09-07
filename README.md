@@ -1,21 +1,31 @@
 # EmergeHelper
 
-A friendlier front-end for Portage on Gentoo. Three things it does:
+A friendlier front-end for Portage on Gentoo.
+
+Anyone who doesn't want to use a terminal isn't going to use Gentoo, so a MacOS-grade 
+"push this button here and everything's done for you" isn't what I'm going for; my goal
+is *convenience*. EmergeHelper (eh) is a convenient way to use Portage if you have a life
+and don't want to spend needless amounts of time setting individual USE flags for every
+single package, don't like getting dizzy from watching everything compile, 
+and also don't want to type "emerge -s [package_name]" and scroll up for miles. Specifics below:
+
 
 1. **A progress meter for builds**, with `Ctrl+O` to switch to the raw
-   compiler output and back.
-2. **USE-flag problems become a prompt, not a dead end** — with the real blast
+   compiler output (if you miss the vertigo-maker 3000) and back.
+2. **USE-flag problems become a prompt instead of die** — with the real blast
    radius of each choice, so you can see when a system-wide setting would
    break something.
 3. **Fast package-name completion** that narrows as you type, pulled straight
-   from Portage's own metadata.
+   from Portage's metadata.
 
-No new packages to emerge: it runs on Python 3 with `psutil` (already
+Dependencies: How about none? No new packages to emerge: it runs on Python 3 with `psutil` (already
 installed) and stdlib `curses`.
 
 ## Install
 
-```sh
+```
+git clone https://github.com/Mr-ShmizzleDizzle/EmergeHelper.git
+cd EmergeHelper
 ./install.sh
 ```
 
@@ -33,8 +43,8 @@ eh -u                         # @world --update --deep --newuse
 
 Every action has a short flag and a word form — use whichever is faster:
 
-| Flag | Word | Does |
-| --- | --- | --- |
+| Flag | Longer flag | Does |
+| --- | ----------- | --- |
 | `-i` `--install` | `install` | Merge packages |
 | `-u` `--update` | `update` | Update `@world` |
 | `-s` `--search` | `search` | Search the index |
