@@ -258,41 +258,6 @@ trailing `~` means the version needs keywording.
 **Overlays are indexed too**, and tagged so you can tell where a package comes
 from:
 
-```
-games-util/steam-launcher   Installer, launcher and supplementary files …  [1.0.0.87 ~] ::steam-overlay
-```
-
-Most overlays ship ebuilds with no `metadata/md5-cache`, so those are read
-through Portage's own API instead of the fast cache scan. That costs a fork
-per ebuild, and Portage's own cache for the results (`/var/cache/edb/dep`) is
-owned by the `portage` group — so as an ordinary user the work is redone from
-scratch every time. `eh` caches it under `~/.cache/emergehelper/depcache`
-instead, where it can actually write, and caps how long the first, uncached
-pass may spend on any one repository; whatever it doesn't reach is listed by
-filename until the cache warms up. A 1700-package overlay takes a few minutes
-once (`eh -x --refresh`) and a moment thereafter, rather than a few minutes
-every time.
-
-Bare `<Tab>` offers the 174 categories; typing narrows them, and a `/` drills
-in. It works with version operators (`>=app-admin/conky-1.2`) and package sets
-(`@world`), and `emerge -C <Tab>` offers only what's installed.
-
-This replaces fish's stock `emerge` completions, which run `find` over the
-whole ebuild tree and `emerge --list-sets` on **every** Tab press:
-
-| | stock fish | EmergeHelper |
-| --- | --- | --- |
-| `emerge -av app-admin/con<Tab>` | 1096 ms | **99 ms** |
-| result quality | 19404 bare names | filtered, with descriptions + versions |
-
-Completions come from a cached index of every package in every configured
-repository (19,411 here). A Tab press never rebuilds it — a rebuild can take
-minutes for a repository with no metadata cache, and a Tab key that hangs is
-worse than a slightly stale one — so `eh` reads the index it has and keeps the
-`[I]` markers current by folding the vdb back in after each merge. Rebuild it
-after a sync, or after adding a repo, with `eh -x --refresh` (~3.5 s once the
-overlay metadata cache is warm); `eh -x` rebuilds too if the tree has moved on.
-
 ## Other commands
 
 ```sh
