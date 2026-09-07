@@ -43,7 +43,7 @@ eh -u                         # @world --update --deep --newuse
 
 Every action has a short flag and a word form — use whichever is faster:
 
-| Flag | Longer flag | Does |
+| Flag | Meaning | Does |
 | --- | ----------- | --- |
 | `-i` `--install` | `install` | Merge packages |
 | `-u` `--update` | `update` | Update `@world` |
